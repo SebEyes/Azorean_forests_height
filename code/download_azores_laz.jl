@@ -30,6 +30,10 @@
 #   # one island only, first 5 tiles, preview
 #   julia code/download_azores_laz.jl --island SMG --limit 5 --dry-run
 
+using Pkg
+Pkg.activate(".")
+Pkg.instantiate()
+
 using HTTP
 using JSON3
 using Dates
