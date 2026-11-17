@@ -1,0 +1,139 @@
+---
+title: "Test_Angra_LAZ_to_Classification_Raster"
+format: html
+editor: visual
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r}
+setwd("/media/fabio/Data/Azores_Maps")
+
+library(lidR); library(terra); library(sf); library(rlas)
+library(future)
+
+
+# --- Setup ---------------------------------------------------------------
+#files <- list.files("/media/fabio/Data/Azores_Maps/Angra_LAS",
+#                    pattern = "\\.laz$", full.names = TRUE)
+#for (f in files) writelax(f)
+#### This is only once for indexing and multiprocessing
+
+
+ctg <- readLAScatalog("/media/fabio/Data/Azores_Maps/Angra_LAS")
+st_crs(ctg) <- 5015                      # PTRA08 / UTM zone 26N
+is.indexed(ctg)
+opt_select(ctg)       <- "xyzc"
+opt_filter(ctg)       <- ""              # all returns, so classes can overlap
+opt_chunk_buffer(ctg) <- 0
+opt_output_files(ctg) <- "tmp/presence_{XLEFT}_{YBOTTOM}"
+
+# 1 = unclassified (used internally only), 2 = ground, 3/4/5 = low/med/high veg,
+# 6 = building, 9 = water, 10 = dirt roads, 11 = roads, 26 = bridges
+classes <- c(1, 2, 3, 4, 5, 6, 9, 10, 11, 26)
+
+# --- Presence/absence per class --------------------------------------------
+presence_fun <- function(cls, classes) {
+  out <- lapply(classes, function(k) as.integer(any(cls == k)))
+  names(out) <- paste0("class_", classes)
+  out
+}
+
+opt_chunk_size(ctg) <- 500        # good balance between RAM and overhead
+plan(multisession, workers = 3)   # or plan(multicore, ...) outside RStudio
+
+pres <- pixel_metrics(ctg, ~presence_fun(Classification, classes), res = 1)
+
+plan(sequential)
+
+for (nm in setdiff(names(pres), "class_1")) {
+  writeRaster(pres[[nm]], paste0("presence_", nm, ".tif"),
+              datatype = "INT1U", gdal = "COMPRESS=DEFLATE", overwrite = TRUE)
+}
+
+# --- Helper: class layer as 0/1, NA treated as 0 ---------------------------
+ras_dir <- "/media/fabio/Data/Azores_Maps/Angra_Classes_PA2"
+
+lyr <- function(k) {
+  x <- pres[[paste0("class_", k)]]
+  ifel(is.na(x), 0, x)
+}
+
+g       <- pres[["class_2"]]
+g0      <- ifel(is.na(g), 0, g)
+veg_unc <- (lyr(1) + lyr(3) + lyr(4) + lyr(5)) > 0
+bridge <- lyr(26) == 1
+
+# --- Buildings: core vs. edge ---------------------------------------------
+bldg  <- lyr(6) == 1
+bcore <- focal(ifel(bldg, 1, 0), w = 3, fun = "min", na.rm = TRUE) == 1   # erode 1 cell
+bedge <- bldg & !bcore                       # outer ring: eaves over sidewalks
+
+# --- Roads: only close holes mostly surrounded by road -------------------
+road_raw <- (lyr(10) + lyr(11)) > 0
+nb_road  <- focal(ifel(road_raw, 1, 0), w = 5, fun = "mean", na.rm = TRUE)
+road     <- road_raw | (nb_road >= 0.5 & lyr(1) == 1 & g0 == 0)
+
+# --- Fill source: real ground that is not road ----------------------------
+barrier <- road | bcore | bridge
+src <- ifel(g0 == 1 & !road, 1, NA)
+for (i in 1:10) {
+  src <- focal(src, w = 3, fun = "max", na.rm = TRUE, na.policy = "only")
+  src <- mask(src, barrier, maskvalues = 1)
+}
+
+# --- Assemble ground layer -------------------------------------------------
+eligible <- (g0 == 0) & (veg_unc | bedge) & !bcore & !road & !bridge
+ground <- ifel(eligible & !is.na(src), 1, g0)
+ground <- ifel(bcore | road, 0, ground)      # bridges keep measured ground beneath
+ground <- mask(ground, g)
+
+writeRaster(ground, file.path(ras_dir, "presence_ground_soil_filled.tif"),
+            datatype = "INT1U", gdal = "COMPRESS=DEFLATE", overwrite = TRUE)
+
+
+#plan(sequential)                 # shuts down any parallel workers
+#rm(list = ls())                  # remove all objects (or rm(pres, g, ...) for specific ones)
+#gc()                             # free the memory
+#terra::tmpFiles(remove = TRUE)   # delete terra's temporary files
+
+
+```
+
+Building height map
+
+```{r}
+library(lidR); library(terra); library(sf); library(future)
+
+ctg <- readLAScatalog("/media/fabio/Data/Azores_Maps/Angra_LAS")
+st_crs(ctg) <- 5015
+opt_select(ctg)     <- "xyzc"
+opt_chunk_size(ctg) <- 500
+
+plan(multisession, workers = 3)      # or plan(multicore, ...) outside RStudio
+
+# --- 1. Ground surface (DTM) ---------------------------------------------
+opt_filter(ctg)       <- "-keep_class 2"
+opt_chunk_buffer(ctg) <- 20
+opt_output_files(ctg) <- "tmp/dtm_{XLEFT}_{YBOTTOM}"
+dtm <- rasterize_terrain(ctg, res = 1, algorithm = tin())
+
+# --- 2. Building top surface ---------------------------------------------
+opt_filter(ctg)       <- "-keep_class 6"
+opt_chunk_buffer(ctg) <- 0
+opt_output_files(ctg) <- "tmp/bdsm_{XLEFT}_{YBOTTOM}"
+bdsm <- pixel_metrics(ctg, ~max(Z), res = 1)
+
+plan(sequential)                     # shut down workers, free their RAM
+
+if (!compareGeom(bdsm, dtm, stopOnError = FALSE)) {
+  bdsm <- resample(bdsm, dtm, method = "near")
+}
+
+# --- 3. Building height per pixel ----------------------------------------
+bh <- bdsm - dtm
+bh <- ifel(bh < 0, 0, bh)            # clamp small negative values from noise
+
+writeRaster(bh, "building_height.tif",
+            datatype = "FLT4S", gdal = "COMPRESS=DEFLATE", overwrite = TRUE)
+```
