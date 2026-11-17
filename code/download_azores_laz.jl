@@ -50,6 +50,19 @@ const COLLECTION  = "ACORES-LAZ"
 const PAGE_SIZE   = 1000             # STAC limit; API caps at 1000
 const OUTFILE_EXT = ".laz"
 
+# Network tuning -------------------------------------------------------------
+# HTTP.jl's default `connect_timeout` is only 30 s and it also bounds the TLS
+# handshake. The DGT download CDN can take considerably longer than that,
+# which surfaces as HTTP.TimeoutError("tls_handshake", 30_000_000_000, ...).
+# Use a generous per-attempt connect timeout (overridable with
+# --connect-timeout), plus explicit limits for the other request phases.
+const CONNECT_TIMEOUT         = Ref(120.0)  # s: TCP connect + TLS handshake
+const RESPONSE_HEADER_TIMEOUT = 120.0       # s: waiting for response headers
+const READ_IDLE_TIMEOUT       = 300.0       # s: max inactivity while streaming
+const DOWNLOAD_ATTEMPTS       = 5           # attempts per tile (fresh link each)
+const RETRY_BACKOFF           = 2.0         # s, doubled after each failed attempt
+const LAS_MAGIC               = "LASF"      # LAS/LAZ files all start with this
+
 # Island codes as they appear in item IDs (e.g. 2024_SMG_... = São Miguel).
 const ISLAND_NAMES = Dict(
     "SMG" => "São Miguel",
@@ -76,9 +89,10 @@ for k in collect(keys(ISLAND_CODES))
 end
 
 # Cookies are collected while following redirects and then reused for API calls.
-const COOKIES    = Dict{String,String}()
-const PRINT_LOCK = ReentrantLock()
-const STATS      = Dict{Symbol,Int}(:ok => 0, :skip => 0, :fail => 0)
+const COOKIES     = Dict{String,String}()
+const COOKIE_LOCK = ReentrantLock()   # COOKIES is touched by every worker thread
+const PRINT_LOCK  = ReentrantLock()
+const STATS       = Dict{Symbol,Int}(:ok => 0, :skip => 0, :fail => 0)
 
 # ---------------------------------------------------------------------------
 # Small helpers
@@ -99,12 +113,14 @@ html_unescape(s::AbstractString) =
                       "&lt;" => "<", "&gt;" => ">")
 
 function store_cookies!(r)
-    for (k, v) in r.headers
-        lowercase(k) == "set-cookie" || continue
-        first = split(v, ';')[1]
-        occursin('=', first) || continue
-        name, value = split(first, '=', limit=2)
-        COOKIES[String(name)] = String(value)
+    lock(COOKIE_LOCK) do
+        for (k, v) in r.headers
+            lowercase(k) == "set-cookie" || continue
+            first = split(v, ';')[1]
+            occursin('=', first) || continue
+            name, value = split(first, '=', limit=2)
+            COOKIES[String(name)] = String(value)
+        end
     end
     return nothing
 end
@@ -112,19 +128,28 @@ end
 function cookie_header(url::AbstractString)
     host = HTTP.URIs.parse_uri(url).host
     occursin("dgterritorio.gov.pt", host) || return ""
-    isempty(COOKIES) && return ""
-    return join(["$(k)=$(v)" for (k, v) in COOKIES], "; ")
+    return lock(COOKIE_LOCK) do
+        isempty(COOKIES) ? "" : join(["$(k)=$(v)" for (k, v) in COOKIES], "; ")
+    end
 end
 
 function request(method::AbstractString, url::AbstractString;
                  headers=Pair{String,String}[], body=nothing,
-                 response_stream=nothing, redirect=false, status_exception=false)
+                 response_stream=nothing, redirect=false, status_exception=false,
+                 retry::Bool=true, retries::Int=4)
     hs = Pair{String,String}[headers...]
     c = cookie_header(url)
     isempty(c) || push!(hs, "Cookie" => c)
 
+    # `connect_timeout` covers both the TCP connect and the TLS handshake in
+    # HTTP.jl v2. Without it the 30 s default is used for each attempt.
     kw = Dict{Symbol,Any}(:redirect => redirect,
-                          :status_exception => status_exception)
+                          :status_exception => status_exception,
+                          :connect_timeout => CONNECT_TIMEOUT[],
+                          :response_header_timeout => RESPONSE_HEADER_TIMEOUT,
+                          :read_idle_timeout => READ_IDLE_TIMEOUT,
+                          :retry => retry,
+                          :retries => retries)
     body !== nothing && (kw[:body] = body)
     response_stream !== nothing && (kw[:response_stream] = response_stream)
 
@@ -333,6 +358,45 @@ end
 # Downloading
 # ---------------------------------------------------------------------------
 
+# The portal's download links are single-use tokens bound to the session that
+# performed the STAC search. A failed/partially consumed token therefore has to
+# be replaced by a brand-new one before retrying.
+function fresh_asset_href(item)
+    id = String(item.id)
+    refreshed = collect_items(; island=island_code(id))
+    for it in refreshed
+        String(it.id) == id || continue
+        assets = jget(it, "assets")
+        asset = jget(assets, "data", jget(assets, "Data", nothing))
+        asset === nothing && continue
+        return String(asset.href)
+    end
+    error("Could not refresh the download link for $id")
+end
+
+function asset_href(item)
+    assets = jget(item, "assets")
+    asset = jget(assets, "data", jget(assets, "Data", nothing))
+    asset === nothing && error("No download asset found for $(String(item.id))")
+    return String(asset.href)
+end
+
+function verify_download(tmp::AbstractString, id::AbstractString, expected::Int)
+    sz = filesize(tmp)
+    expected > 0 && sz != expected &&
+        error("Size mismatch for $id: got $sz, expected $expected")
+    sz == 0 && error("Empty download for $id")
+
+    # A LAS/LAZ file always starts with the ASCII magic "LASF"; this catches
+    # HTML error pages returned with a 200 status when file:size is unknown.
+    open(tmp, "r") do io
+        magic = String(read(io, 4))
+        magic == LAS_MAGIC || error("Downloaded file for $id is not a LAS/LAZ file " *
+                                     "(starts with $(repr(magic)))")
+    end
+    return nothing
+end
+
 function download_item(item; outdir::AbstractString, force::Bool=false, dryrun::Bool=false)
     id   = String(item.id)
     props = jget(item, "properties")
@@ -344,28 +408,46 @@ function download_item(item; outdir::AbstractString, force::Bool=false, dryrun::
     end
     dryrun && return :would, expected
 
-    assets = jget(item, "assets")
-    asset  = jget(assets, "data", jget(assets, "Data", nothing))
-    asset === nothing && error("No download asset found for $id")
-    href = String(asset.href)
-
-    # IMPORTANT: do not probe with HEAD. The portal's download token is
-    # single-use: a HEAD request consumes it and the following GET returns
-    # 403 "Expired token". Let HTTP.jl follow the redirect in this one GET.
+    href = asset_href(item)
     tmp = path * ".part.$(threadid())"
-    isfile(tmp) && rm(tmp; force=true)
-    open(tmp, "w") do io
-        r = request("GET", href; response_stream=io, redirect=true)
-        flush(io)
-        r.status in (200, 206) || error("HTTP $(r.status) while downloading $id")
+    last_err = nothing
+
+    for attempt in 1:DOWNLOAD_ATTEMPTS
+        # Fresh temporary file each time: a half-written file must never be
+        # mistaken for a complete download, and must never be appended to.
+        isfile(tmp) && rm(tmp; force=true)
+        try
+            if attempt > 1
+                # Expired/consumed tokens need a new link; back off first so a
+                # struggling CDN is not hammered.
+                sleep(RETRY_BACKOFF * 2^(attempt - 2))
+                href = fresh_asset_href(item)
+            end
+
+            # IMPORTANT: do not probe with HEAD (it consumes the single-use
+            # token). HTTP.jl follows the redirect in this one GET. We handle
+            # retries ourselves so every attempt gets a fresh link and a fresh
+            # temporary file, hence retry=false here.
+            open(tmp, "w") do io
+                r = request("GET", href; response_stream=io, redirect=true,
+                            retry=false)
+                r.status in (200, 206) || error("HTTP $(r.status) while downloading $id")
+                flush(io)
+            end
+
+            verify_download(tmp, id, expected)
+            mv(tmp, path; force=true)
+            return :ok, expected
+        catch e
+            last_err = e
+            isfile(tmp) && rm(tmp; force=true)
+            if attempt < DOWNLOAD_ATTEMPTS
+                @warn "Attempt $attempt/$DOWNLOAD_ATTEMPTS failed for $id: $e — retrying"
+            end
+        end
     end
 
-    if expected > 0 && filesize(tmp) != expected
-        rm(tmp; force=true)
-        error("Size mismatch for $id: got $(filesize(tmp)), expected $expected")
-    end
-    mv(tmp, path; force=true)
-    return :ok, expected
+    error("Failed to download $id after $DOWNLOAD_ATTEMPTS attempts: $last_err")
 end
 
 # ---------------------------------------------------------------------------
@@ -412,6 +494,8 @@ function help()
                           (names such as "sao-miguel" are also accepted)
       --limit N           Download at most N tiles
       --workers N         Parallel downloads (also set julia -t N), default 1
+      --connect-timeout N Connect/TLS-handshake timeout in seconds (default 120);
+                          raise this if downloads fail with tls_handshake timeouts
       --list-only         Only list tiles/sizes; no login or downloads
       --dry-run           Show which files would be downloaded
       --force             Re-download files even if they already exist
@@ -427,6 +511,8 @@ function main()
     island   = get(opts, "island", nothing)
     limit    = haskey(opts, "limit") ? parse(Int, opts["limit"]) : nothing
     workers  = haskey(opts, "workers") ? parse(Int, opts["workers"]) : 1
+    haskey(opts, "connect-timeout") && (CONNECT_TIMEOUT[] = parse(Float64, opts["connect-timeout"]))
+    CONNECT_TIMEOUT[] > 0 || error("--connect-timeout must be a positive number of seconds")
     dryrun   = "dry-run" in flags
     listonly = "list-only" in flags
     force    = "force" in flags
