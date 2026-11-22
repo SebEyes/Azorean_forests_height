@@ -1,0 +1,10 @@
+island,input_raster,output_raster,p99_m,n_valid_pixels,n_nodata_pixels,n_masked_pixels,pct_masked
+COR,COR_vegetation_height.tif,COR_vegetation_height_p99.tif,11.4659,17269048,8783279,172684,0.999962
+FAI,FAI_vegetation_height.tif,FAI_vegetation_height_p99.tif,23.3267,174049600,124022685,1740492,0.999998
+FLO,FLO_vegetation_height.tif,FLO_vegetation_height_p99.tif,21.0962,141709372,77763464,1416971,0.999913
+GRA,GRA_vegetation_height.tif,GRA_vegetation_height_p99.tif,20.5103,61676711,58355839,616739,0.999954
+PIC,PIC_vegetation_height.tif,PIC_vegetation_height_p99.tif,19.9906,446482356,463606971,4465095,1.000061
+SJO,SJO_vegetation_height.tif,SJO_vegetation_height_p99.tif,19.0223,245102934,1021457634,2450961,0.999972
+SMA,SMA_vegetation_height.tif,SMA_vegetation_height_p99.tif,25.6780,98300335,63895016,983115,1.000114
+SMG,SMG_vegetation_height.tif,SMG_vegetation_height_p99.tif,29.0033,739124608,691090892,7389907,0.999819
+TER,TER_vegetation_height.tif,TER_vegetation_height_p99.tif,26.4972,402254525,168525347,4021951,0.999852
