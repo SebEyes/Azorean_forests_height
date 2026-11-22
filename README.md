@@ -1,6 +1,6 @@
 # Azorean forest vegetation height
 
-A Julia workflow for deriving **1 m vegetation-height rasters** from the Portuguese Directorate-General for Territory (DGT) ACORES-LAZ classified LiDAR point-cloud collection. The pipeline retrieves LAZ tiles from the DGT catalogue, estimates terrain and vegetation surfaces, writes GeoTIFF canopy-height products, mosaics them by island, and provides raster quality-control summaries.
+A Julia workflow for deriving **1 m vegetation-height rasters** from the [Portuguese Directorate-General for Territory (DGT) ACORES-LAZ classified LiDAR point-cloud collection](https://portugal3d.dgterritorio.gov.pt/acores). The pipeline retrieves LAZ tiles from the DGT catalogue, estimates terrain and vegetation surfaces, writes GeoTIFF canopy-height products, mosaics them by island, and provides raster quality-control summaries.
 
 For each 1 m cell, the processor estimates a digital terrain model (DTM) from class 2 ground returns, fills nearby ground gaps, takes the maximum elevation of vegetation returns in classes 3, 4, and 5 (DSMv), and calculates `max(0, DSMv - DTM)`. Cells with no vegetation are zero; cells without ground support inside the fill radius are NoData. Other point classes are excluded. The source raster CRS is read from the LAZ header where available; use `--epsg` when it is absent.
 
