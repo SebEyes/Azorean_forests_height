@@ -1,3 +1,6 @@
+#Tiled Point cloud files
 *.laz
+
+# Rasters and associated QGIS-generated files
 *.tif
 *.aux.xml
