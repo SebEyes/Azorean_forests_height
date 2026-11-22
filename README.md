@@ -17,7 +17,8 @@ For each 1 m cell, the processor estimates a digital terrain model (DTM) from cl
 │   ├── laz_to_vegetation_height.jl # One LAZ tile -> vegetation-height GeoTIFF
 │   ├── compute_archipelago.jl      # Download, process, and mosaic by island
 │   ├── raster_quality_check.jl     # Distribution/outlier QC reports
-│   └── filter_raster_p99.jl        # Mask values above each island mosaic's estimated P99
+│   ├── filter_raster_p99.jl        # Percentile filter + optional bilinear gap filling
+│   └── run_p999_bilinear.jl        # P99.9 + bilinear runner used for the products
 ├── data/vegetation_height/qc/      # Committed QC outputs
 └── doc/Data_source.pdf             # Data-source documentation
 ```
@@ -105,32 +106,46 @@ julia --threads=6 code/raster_quality_check.jl \
 
 The QC script scans raster windows and writes `height_distribution_by_island.csv` (island summaries), `height_histogram.csv`, `height_outlier_blocks.csv`, `height_extreme_pixels.csv`, and the self-contained `height_distribution_report.html`. Its defaults and optional island/threshold settings are documented by `--help`.
 
-### 6. Filter island mosaics above their estimated P99 (optional)
+### 6. Filter extreme values with a percentile threshold (optional)
 
-To create filtered copies after mosaicking (and optionally after QC), run:
+P99 removes about 1 % of valid pixels and can discard genuinely tall trees, so the products in this repository use **P99.9** (about 0.1 % removed). Each island mosaic is evaluated independently: the threshold is computed from all valid pixels of that mosaic, values strictly above it are treated as outliers, and — with `--interpolate` — each removed pixel is replaced by a bilinear estimate from surrounding valid pixels. Pixels that were already NoData in the source mosaic are never filled, and the original mosaics are left unchanged.
+
+Recommended command (P99.9 with bilinear filling of the removed pixels):
 
 ```sh
-julia --threads=4 code/filter_raster_p99.jl \
+julia --project code/run_p999_bilinear.jl
+```
+
+`run_p999_bilinear.jl` embeds the settings (`--percentile 0.999 --interpolate`) so the result is reproducible when the process is launched in the background. Optional environment variables: `AZORES_ISLAND=CODE` to process one island, `AZORES_OUTDIR=DIR` to write elsewhere, and `AZORES_RASTER_DIR=DIR` to read from elsewhere.
+
+The underlying script can be called directly for other thresholds:
+
+```sh
+julia code/filter_raster_p99.jl \
+  --percentile 0.999 --interpolate \
   --raster-dir data/vegetation_height \
   --outdir data/vegetation_height
 ```
 
-By default, the script finds merged inputs named `<CODE>_vegetation_height.tif`, computes a separate P99 threshold for each island from all valid pixels, and writes `<CODE>_vegetation_height_p99.tif`. Values strictly above the threshold are changed to NoData; the original mosaics are left unchanged. `p99_filter_summary.csv` records the threshold, valid-pixel count, NoData/non-finite count, masked-pixel count, and percentage masked for each island. The threshold is a histogram-based estimate (default bin width `0.01` m); values at or above the default `--max-height 120` m share an overflow bin, so it is not an exact raw-pixel quantile. Raster scanning/writing is windowed (default 256 rows) to limit memory use.
+With `--percentile 0.999 --interpolate`, outputs are `<CODE>_vegetation_height_p999.tif` and `p999_filter_summary.csv`. With the default `--percentile 0.99` and no `--interpolate`, outputs are `<CODE>_vegetation_height_p99.tif` and `p99_filter_summary.csv`, with outlier pixels left as NoData. The summary records the threshold (`<label>_m`), input/output filenames, valid-pixel and NoData counts, the masked count and percentage, how many pixels were filled by interpolation, how many could not be filled (`n_unfilled`), and whether interpolation was enabled.
 
-Use `--island COR` to filter only one island, `--bin-width M` or `--max-height M` to change the histogram settings, `--block-rows N` to change the window height, and `--suffix STR` to change the output suffix. Defaults are `--raster-dir data/vegetation_height` and `--outdir` equal to the input directory. For example, to keep filtered outputs separate:
+Bilinear filling finds the nearest valid pixels to the left and right in the nearest rows above and below (within a 64-row halo), interpolates horizontally in those rows and then vertically. If no valid neighbours can be found, the pixel stays NoData and is counted in `n_unfilled`. Interpolated values are weighted averages of neighbouring valid values, so they cannot exceed the threshold.
+
+The threshold is a histogram-based estimate (default bin width `0.01` m); values at or above `--max-height 120` m share an overflow bin, so it is not an exact raw-pixel quantile. Scanning and writing are windowed (default 256 rows) to limit memory use. Other options: `--island COR`, `--suffix STR`, `--summary FILE`, `--bin-width M`, `--max-height M`, and `--block-rows N`. Defaults: `--raster-dir data/vegetation_height` and `--outdir` equal to the input directory. For example, to keep filtered outputs separate:
 
 ```sh
 julia code/filter_raster_p99.jl \
+  --percentile 0.999 --interpolate \
   --raster-dir data/vegetation_height \
   --outdir data/vegetation_height/qc \
   --island COR
 ```
 
-Run `julia code/filter_raster_p99.jl --help` for all options. The script activates and instantiates the repository Julia environment at startup.
+Run `julia code/filter_raster_p99.jl --help` for the full option list. Both scripts activate and instantiate the repository Julia environment at startup.
 
 ## Data source and interpretation
 
-The primary point-cloud source for the Julia pipeline is the Portuguese Directorate-General for Territory (DGT) ACORES-LAZ collection, accessed through the DGT catalogue (`https://cdd.dgterritorio.gov.pt/dgt-fe/mapa?collection=ACORES-LAZ`); the downloader enumerates this collection and requires DGT authentication to download its LAZ assets. Consult [`doc`](doc/) for official source information and the scripts' help/comments for algorithm details. **The generated vegetation-height surface is an estimate based on classified returns and the configured ground-gap filling, not a direct field measurement**. P99-filtered rasters are further processed copies that mask high values; they do not replace the source mosaics. Review the QC products and validate against the intended study use before interpreting extreme values.
+The primary point-cloud source for the Julia pipeline is the Portuguese Directorate-General for Territory (DGT) ACORES-LAZ collection, accessed through the [DGT catalogue](`https://cdd.dgterritorio.gov.pt/dgt-fe/mapa?collection=ACORES-LAZ`); the downloader enumerates this collection and requires DGT authentication to download its LAZ assets. Consult [`doc`](doc/) for official source information and the scripts' help/comments for algorithm details. **The generated vegetation-height surface is an estimate based on classified returns and the configured ground-gap filling, not a direct field measurement**. The P99.9-filtered rasters are further processed copies in which pixels above each island's threshold were replaced by bilinear estimates; they do not replace the source mosaics, and areas that were NoData originally remain NoData. Review the QC products and validate against the intended study use before interpreting extreme values.
 
 ## Code maintenance
 
