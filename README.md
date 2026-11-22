@@ -13,7 +13,6 @@ For each 1 m cell, the processor estimates a digital terrain model (DTM) from cl
 ├── Project.toml                    # Direct Julia project dependencies
 ├── Manifest.toml                   # Resolved Julia environment (Julia 1.13.3)
 ├── code/
-│   ├── 00-julia_env_initialisation.jl
 │   ├── download_azores_laz.jl      # DGT catalogue search and LAZ download
 │   ├── laz_to_vegetation_height.jl # One LAZ tile -> vegetation-height GeoTIFF
 │   ├── compute_archipelago.jl      # Download, process, and mosaic by island
@@ -37,8 +36,6 @@ From the repository root, instantiate the project environment:
 ```sh
 julia --project=. -e 'using Pkg; Pkg.instantiate()'
 ```
-
-The script `code/00-julia_env_initialisation.jl` also activates and instantiates the project.
 
 ## Usage
 

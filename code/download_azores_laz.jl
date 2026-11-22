@@ -13,7 +13,6 @@
 #   3. downloads each .laz file and verifies it against the LAS header / STAC
 #      point count (`file:size` is only advisory — DGT metadata can be stale).
 #
-# Requires: HTTP, JSON3 (see code/00-julia_env_initialisation.jl).
 #
 # Examples
 # --------
@@ -84,7 +83,7 @@ for (code, name) in ISLAND_NAMES
                                         "ó" => "o", "ú" => "u", "ç" => "c"))] = code
     ISLAND_CODES[lowercase(code)] = code
 end
-ISLAND_CODES["sjg"] = "SJO"   # alias used in code/00-julia_env_initialisation.jl
+ISLAND_CODES["sjg"] = "SJO"
 for k in collect(keys(ISLAND_CODES))
     occursin(' ', k) && (ISLAND_CODES[replace(k, " " => "-")] = ISLAND_CODES[k])
 end
